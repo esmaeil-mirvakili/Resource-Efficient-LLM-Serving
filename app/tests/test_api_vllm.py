@@ -1,3 +1,4 @@
+# app/tests/test_api_vllm.py
 import os
 import importlib
 import pytest
@@ -7,36 +8,57 @@ import sys, pathlib
 # Ensure project root is importable
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-# Skip the whole module if transformers isn't installed
-pytest.importorskip("transformers", reason="transformers not installed")
+# Skip the whole module if vLLM isn't installed
+pytest.importorskip("vllm", reason="vLLM not installed")
+
+# Pick a tiny model vLLM supports; override with env if you want
+DEFAULT_MODEL = os.environ.get("VLLM_TEST_MODEL", "EleutherAI/pythia-70m-deduped")
 
 
-def _build_transformers_client(
-    monkeypatch, model_id: str = "sshleifer/tiny-gpt2"
+def _has_cuda() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _build_vllm_client(
+    monkeypatch, model_id: str = DEFAULT_MODEL
 ) -> tuple[TestClient, object]:
     """
-    Create a TestClient with BACKEND=transformers on CPU.
-    Returns (client, sm_module) so callers can access server symbols if needed.
+    Create a TestClient with BACKEND=vllm.
+    We pre-instantiate VLLMBackend to fail fast (and skip) on unsupported envs.
     """
-    # Force env for this test instance
-    monkeypatch.setenv("BACKEND", "transformers")
+    # Env for this test instance
+    monkeypatch.setenv("BACKEND", "vllm")
     monkeypatch.setenv("MODEL_ID", model_id)
     monkeypatch.setenv("AUTH_ENABLED", "false")
     monkeypatch.delenv("AUTH_TOKEN", raising=False)
-    # Keep everything on CPU
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+
+    # Prefer CPU unless CUDA is clearly available or explicitly forced
+    if not os.environ.get("BACKEND_DEVICE"):
+        device = (
+            "cuda" if (_has_cuda() or os.getenv("VLLM_FORCE_CUDA") == "1") else "cpu"
+        )
+        monkeypatch.setenv("BACKEND_DEVICE", device)
+
+    # Be generous with timeouts to avoid flakes on slow CPU envs
+    monkeypatch.setenv("GEN_TIMEOUT_S", "120")
+    monkeypatch.setenv("ACQUIRE_TIMEOUT_S", "1.0")
     monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
-    monkeypatch.setenv("MKL_NUM_THREADS", "1")          # just in case on x86
-    monkeypatch.setenv("VECLIB_MAXIMUM_THREADS", "1")   # Apple Accelerate
     monkeypatch.setenv("OPENBLAS_NUM_THREADS", "1")
+    monkeypatch.setenv("MKL_NUM_THREADS", "1")
+    monkeypatch.setenv("VECLIB_MAXIMUM_THREADS", "1")
 
-    # Import/reload the server module so it reads the env
+    # Import/reload server so it reads env
     import app.server as sm
 
     sm = importlib.reload(sm)
 
-    # Clear DI singletons to pick up new env
+    # Clear DI caches
     try:
         sm.get_settings.cache_clear()
     except Exception:
@@ -46,37 +68,41 @@ def _build_transformers_client(
     except Exception:
         pass
 
-    # Sanity: verify the backend really is Transformers; if not, skip
+    # Try to stand up the vLLM backend now; skip if this env can't run it
     try:
-        be = sm.get_backend()  # this will instantiate the backend
-    except Exception as e:
-        pytest.skip(f"Transformers backend not available or failed to load: {e!r}")
+        from app.core.backends.vllm_backend import VLLMBackend
 
-    if "Transformers" not in be.__class__.__name__:
-        pytest.skip("Server does not wire BACKEND=transformers; skipping.")
+        be = VLLMBackend(model_id=model_id, device=os.environ.get("BACKEND_DEVICE"))
+    except Exception as e:
+        pytest.skip(f"vLLM backend failed to initialize for '{model_id}': {e!r}")
+
+    # Freeze this backend instance so routes reuse it (no double init)
+    monkeypatch.setattr(sm, "get_backend", lambda: be, raising=True)
 
     app = sm.create_app()
     return TestClient(app), sm
 
 
 @pytest.mark.slow
-def test_transformers_models_endpoint(monkeypatch):
-    client, sm = _build_transformers_client(monkeypatch, model_id="sshleifer/tiny-gpt2")
+def test_vllm_models_endpoint(monkeypatch):
+    client, sm = _build_vllm_client(monkeypatch)
     r = client.get("/v1/models")
     assert r.status_code == 200
     data = r.json()
     assert data["object"] == "list"
-    assert data["data"][0]["id"] == "sshleifer/tiny-gpt2"  # should reflect MODEL_ID from env
+    # Should reflect MODEL_ID from env
+    assert data["data"][0]["id"] == os.environ.get("MODEL_ID", DEFAULT_MODEL)
 
 
 @pytest.mark.slow
-def test_transformers_chat_completion_non_stream(monkeypatch):
-    client, sm = _build_transformers_client(monkeypatch, model_id="sshleifer/tiny-gpt2")
+def test_vllm_chat_completion_non_stream(monkeypatch):
+    client, sm = _build_vllm_client(monkeypatch)
     payload = {
-        "model": "sshleifer/tiny-gpt2",
+        "model": os.environ.get("MODEL_ID", DEFAULT_MODEL),
         "messages": [{"role": "user", "content": "Say hi in five words."}],
-        "max_tokens": 12,  # keep it small for CPU speed
+        "max_tokens": 12,
         "stream": False,
+        "temperature": 0.7,
     }
     r = client.post("/v1/chat/completions", json=payload)
     assert r.status_code == 200, r.text
@@ -86,17 +112,16 @@ def test_transformers_chat_completion_non_stream(monkeypatch):
     assert msg["role"] == "assistant"
     assert isinstance(msg["content"], str) and len(msg["content"]) > 0
     usage = body["usage"]
-    # Usage invariants
     assert usage["prompt_tokens"] > 0
     assert usage["completion_tokens"] > 0
     assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
 
 
 @pytest.mark.slow
-def test_transformers_chat_completion_streaming_sse(monkeypatch):
-    client, sm = _build_transformers_client(monkeypatch, model_id="sshleifer/tiny-gpt2")
+def test_vllm_chat_completion_streaming_sse(monkeypatch):
+    client, sm = _build_vllm_client(monkeypatch)
     payload = {
-        "model": "sshleifer/tiny-gpt2",
+        "model": os.environ.get("MODEL_ID", DEFAULT_MODEL),
         "messages": [{"role": "user", "content": "Write a short greeting."}],
         "max_tokens": 10,
         "stream": True,
