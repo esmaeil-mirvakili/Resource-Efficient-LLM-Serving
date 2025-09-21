@@ -212,3 +212,6 @@ __marimo__/
 data/
 outputs/
 wandb/
+ui/node_modules/
+ui/.next/
+ui/package-lock.json
