@@ -85,7 +85,7 @@ def _build_vllm_client(
 
 @pytest.mark.slow
 def test_vllm_models_endpoint(monkeypatch):
-    client, sm = _build_vllm_client(monkeypatch)
+    client, _ = _build_vllm_client(monkeypatch)
     r = client.get("/v1/models")
     assert r.status_code == 200
     data = r.json()
@@ -96,7 +96,7 @@ def test_vllm_models_endpoint(monkeypatch):
 
 @pytest.mark.slow
 def test_vllm_chat_completion_non_stream(monkeypatch):
-    client, sm = _build_vllm_client(monkeypatch)
+    client, _ = _build_vllm_client(monkeypatch)
     payload = {
         "model": os.environ.get("MODEL_ID", DEFAULT_MODEL),
         "messages": [{"role": "user", "content": "Say hi in five words."}],
@@ -119,7 +119,7 @@ def test_vllm_chat_completion_non_stream(monkeypatch):
 
 @pytest.mark.slow
 def test_vllm_chat_completion_streaming_sse(monkeypatch):
-    client, sm = _build_vllm_client(monkeypatch)
+    client, _ = _build_vllm_client(monkeypatch)
     payload = {
         "model": os.environ.get("MODEL_ID", DEFAULT_MODEL),
         "messages": [{"role": "user", "content": "Write a short greeting."}],

@@ -22,10 +22,14 @@ from prometheus_client import (
     Gauge,
     generate_latest,
 )
-
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 from app.api.errors import error_response
 from app.api.models import ChatRequest, ChatResponse, Choice, ModelsResponse, Usage
 from app.core.backends.inmemory_backend import InMemoryBackend
+from dotenv import load_dotenv, find_dotenv
+
+load_dotenv(find_dotenv(), override=False)
 
 
 class TokenBucket:
@@ -193,51 +197,76 @@ def _configure_tracing_if_enabled(app: FastAPI, settings: "Settings") -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings & DI
 # ─────────────────────────────────────────────────────────────────────────────
+class Settings(BaseSettings):
+    # --- Core ---
+    CORS_ORIGINS: List[str] = ["*"]  # comma-separated in env
+    AUTH_ENABLED: bool = False
+    AUTH_TOKEN: Optional[str] = None
+    MODEL_ID: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    BACKEND: str = "transformers"  # inmemory | transformers | vllm
 
+    # --- Runtime controls ---
+    MAX_CONCURRENCY: int = 4
+    GEN_TIMEOUT_S: float = 30.0
+    ACQUIRE_TIMEOUT_S: float = 0.005
 
-class Settings:
-    def __init__(self) -> None:
-        # Read env at instance time so tests can flip env + cache_clear()
-        self.CORS_ORIGINS: List[str] = os.getenv("CORS_ORIGINS", "*").split(",")
-        self.AUTH_ENABLED: bool = os.getenv("AUTH_ENABLED", "false").lower() == "true"
-        self.AUTH_TOKEN: Optional[str] = os.getenv("AUTH_TOKEN")
-        self.MODEL_ID: str = os.getenv("MODEL_ID", "dummy-1")
-        self.BACKEND: str = os.getenv("BACKEND", "inmemory").lower()
-        # New: runtime controls
-        self.MAX_CONCURRENCY: int = int(os.getenv("MAX_CONCURRENCY", "4"))
-        self.GEN_TIMEOUT_S: float = float(os.getenv("GEN_TIMEOUT_S", "30"))
-        # Non-blocking acquire timeout; if we can't grab a slot fast, return 429
-        self.ACQUIRE_TIMEOUT_S: float = float(os.getenv("ACQUIRE_TIMEOUT_S", "0.005"))
-        # Warmup & readiness gating (default OFF to not break tests)
-        self.WARMUP_ON_START: bool = (
-            os.getenv("WARMUP_ON_START", "false").lower() == "true"
-        )
-        self.READINESS_REQUIRES_WARMUP: bool = (
-            os.getenv("READINESS_REQUIRES_WARMUP", "false").lower() == "true"
-        )
-        self.WARMUP_TIMEOUT_S: float = float(os.getenv("WARMUP_TIMEOUT_S", "30"))
-        self.LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-        self.LOG_JSON: bool = os.getenv("LOG_JSON", "false").lower() == "true"
-        # OpenTelemetry
-        self.OTEL_ENABLED: bool = os.getenv("OTEL_ENABLED", "false").lower() == "true"
-        self.OTEL_EXPORTER_OTLP_ENDPOINT: str | None = os.getenv(
-            "OTEL_EXPORTER_OTLP_ENDPOINT"
-        )  # e.g. "http://localhost:4318"
-        self.OTEL_SERVICE_NAME: str = os.getenv("OTEL_SERVICE_NAME", "llm-service")
-        self.OTEL_SAMPLER: str = os.getenv(
-            "OTEL_SAMPLER", "parentbased_always_on"
-        )  # keep simple defaults
+    # --- Warmup / readiness ---
+    WARMUP_ON_START: bool = False
+    READINESS_REQUIRES_WARMUP: bool = False
+    WARMUP_TIMEOUT_S: float = 30.0
+
+    # --- Logging ---
+    LOG_LEVEL: str = "INFO"
+    LOG_JSON: bool = False
+
+    # --- OpenTelemetry ---
+    OTEL_ENABLED: bool = True
+    OTEL_EXPORTER_OTLP_ENDPOINT: Optional[str] = None  # e.g., http://localhost:4318
+    OTEL_SERVICE_NAME: str = "llm-service"
+    OTEL_SAMPLER: str = "parentbased_always_on"
+
+    # Load from process env and .env (process env wins)
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # ---- validators / coercions ----
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def _split_cors(cls, v):
+        # Accept comma-separated string or list
+        if v is None:
+            return ["*"]
+        if isinstance(v, str):
+            s = v.strip()
+            return ["*"] if s == "" else [p.strip() for p in s.split(",")]
+        return v
+
+    @field_validator("BACKEND", mode="before")
+    @classmethod
+    def _normalize_backend(cls, v):
+        if v is None:
+            return "inmemory"
+        return str(v).strip().lower()
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    logger.bind(request_id=10).info(f"Using backend {json.dumps(settings.__dict__)}")
+    return settings
 
 
 @lru_cache(maxsize=1)
 def get_backend():
     """Env-driven backend switch; tests often monkeypatch this symbol directly."""
     settings = get_settings()
+    logger.bind(request_id=10).info(
+        f"Using backend {settings.BACKEND}, {settings.MODEL_ID}"
+    )
     if settings.BACKEND == "transformers":
         from app.core.backends.transformers_backend import TransformersBackend
 
@@ -245,7 +274,7 @@ def get_backend():
     if settings.BACKEND == "vllm":
         from app.core.backends.vllm_backend import VLLMBackend
 
-        # Let vLLM pick device; override with BACKEND_DEVICE if you want
+        # Let vLLM pick device
         device = os.getenv("BACKEND_DEVICE")  # e.g. "cuda", "cpu"
         return VLLMBackend(model_id=settings.MODEL_ID, device=device)
     return InMemoryBackend(model_id=settings.MODEL_ID)
@@ -452,6 +481,10 @@ def create_app() -> FastAPI:
         backend = get_backend()
         s = get_settings()
 
+        if s.OTEL_ENABLED:
+            from opentelemetry import trace
+            tracer = trace.get_tracer("llm")
+
         # Normalize messages & collect generation params
         messages = _normalize_messages(req.messages)
         gen_params = {
@@ -574,10 +607,15 @@ def create_app() -> FastAPI:
             )
 
             try:
-                text, usage = await asyncio.wait_for(
-                    backend.generate(messages, req.max_tokens, params=gen_params),
-                    timeout=s.GEN_TIMEOUT_S,
-                )
+                with tracer.start_as_current_span("chat.generate") as span:
+                    span.set_attribute("llm.model", backend.model_id)
+                    span.set_attribute("llm.backend", type(backend).__name__)
+                    text, usage = await asyncio.wait_for(
+                        backend.generate(messages, req.max_tokens, params=gen_params),
+                        timeout=s.GEN_TIMEOUT_S,
+                    )
+                    span.set_attribute("llm.usage.prompt_tokens", usage["prompt_tokens"])
+                    span.set_attribute("llm.usage.completion_tokens", usage["completion_tokens"])
             except asyncio.TimeoutError:
                 return _structured_error(
                     504,

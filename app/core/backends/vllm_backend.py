@@ -14,14 +14,6 @@ except Exception as e:  # pragma: no cover
 
 
 class VLLMBackend:
-    """
-    Minimal vLLM backend:
-      - same interface as your other backends
-      - honors temperature/top_p/top_k/stop/seed/max_tokens
-      - streaming implemented by chunking final text (simple, reliable)
-    NOTE: vLLM works best on Linux + CUDA. CPU/Mac may be unsupported/very slow.
-    """
-
     def __init__(
         self,
         model_id: str,

@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 loguru
+python-dotenv
 pytest
 torch
 transformers>=4.41.0
@@ -11,4 +12,10 @@ omegaconf>=2.3
 prometheus-client
 httpx
 opentelemetry-api
+pydantic
+pydantic-settings
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-asgi
 vllm

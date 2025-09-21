@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3100:3000"]  # UI → http://localhost:3100
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on: [prometheus, tempo]
+    volumes:
+      - ./provisioning:/etc/grafana/provisioning
+
+  prometheus:
+    image: prom/prometheus:latest
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    ports: ["9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  tempo:
+    image: grafana/tempo:latest
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    # Only expose the HTTP query port to the host; keep OTLP ports internal
+    ports:
+      - "3200:3200"     # Tempo HTTP (Grafana datasource)
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    command: [ "--config=/etc/otelcol/config.yaml" ]
+    ports:
+      - "4318:4318"     # OTLP HTTP from your app
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    depends_on: [tempo]
