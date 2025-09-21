@@ -9,7 +9,6 @@ try:
 except Exception as e:  # pragma: no cover
     raise ImportError(
         "vLLM is not installed or failed to import. "
-        "Install with `pip install vllm` (CUDA) or `pip install vllm-cpu` (experimental)."
     ) from e
 
 
@@ -35,7 +34,24 @@ class VLLMBackend:
         if download_dir is not None:
             llm_kwargs["download_dir"] = download_dir
         if device is not None:
-            llm_kwargs["device"] = device  # vLLM supports "cuda"|"cpu" when available
+            llm_kwargs["device"] = device
+
+        # quantization
+        quant = os.getenv("VLLM_QUANTIZATION")
+        if quant:
+            llm_kwargs["quantization"] = quant
+
+        # speculative decoding (draft model)
+        draft = os.getenv("VLLM_DRAFT_MODEL", None)
+        if draft:
+            llm_kwargs["speculative_model"] = draft
+            # optional cap (vLLM will handle details)
+            try:
+                max_draft = int(os.getenv("VLLM_SPECULATIVE_MAX_TOKENS", "") or 0)
+                if max_draft > 0:
+                    llm_kwargs["speculative_max_model_len"] = max_draft
+            except ValueError:
+                pass
 
         # Respect HF cache if present
         cache_dir = os.getenv("TRANSFORMERS_CACHE") or os.getenv("HF_HOME")
